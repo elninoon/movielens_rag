@@ -1,0 +1,15 @@
+.env
+data/
+cache/
+outputs/
+build/
+__pycache__/
+.pytest_cache/
+*.pyc
+
+# 本机凭证、临时产物和课程交付材料不公开提交
+.env.*
+!.env.example
+.chart-data-*/
+deliverables/
+docs/ai_notes.md
