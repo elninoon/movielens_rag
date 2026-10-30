@@ -16,9 +16,9 @@
 
 > GitHub 公开仓库包含代码与说明；`data/`、`outputs/`、`deliverables/` 和本机 `.env` 不随仓库上传。文中这些路径指本地实验目录；报告和汇报材料由组内课程渠道共享。队友首次运行需按下文准备数据，并使用自己的 API 配置。
 
-## 给组员的阅读指南
+## 阅读指南
 
-第一次接触 RAG，建议先读下面的「完整流程」，再查看「运行与复现」。已有实验已经完成，查看报告和演示不需要重新调用模型。想核对实现时，按 `scripts/prepare_movielens.py → data.py → retrieval.py → generation.py → grounding.py → evaluation.py` 的顺序阅读，后五个文件都在 `src/movie_rag/` 中。
+如果是第一次接触 RAG，建议先读下面的「完整流程」，再查看「运行与复现」。已有实验已经完成，查看报告和演示不需要重新调用模型。想核对实现时，按 `scripts/prepare_movielens.py → data.py → retrieval.py → generation.py → grounding.py → evaluation.py` 的顺序阅读，后五个文件都在 `src/movie_rag/` 中。
 
 ## 完整流程：从评分记录到十部推荐
 
