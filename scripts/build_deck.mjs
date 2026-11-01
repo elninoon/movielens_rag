@@ -1,3 +1,4 @@
+// 历史材料构建器：只重建outputs/formal旧流程PPT，不代表当前100→50→30→10方法。
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';

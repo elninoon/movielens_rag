@@ -9,15 +9,15 @@ import numpy as np
 
 
 class Retriever:
-    def __init__(self, store, client, cache_dir, top_k=30, use_rerank=True):
-        if top_k < 10:
-            raise ValueError("top_k 至少为 10")
+    def __init__(self, store, client, cache_dir, top_k=30, coarse_k=50):
+        if not 10 <= top_k <= coarse_k:
+            raise ValueError("筛选数量须满足 10 <= top_k <= coarse_k")
         if not getattr(client, "embedding_model", None):
             raise ValueError("client.embedding_model 必须指定，防止混用缓存")
         self.store = store
         self.client = client
         self.top_k = top_k
-        self.use_rerank = use_rerank
+        self.coarse_k = coarse_k
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         # 缓存身份同时绑定模型、维度及服务地址，避免跨地域或配置复用。
@@ -114,47 +114,54 @@ class Retriever:
 
     def retrieve(self, case):
         seen = {int(row["movie_id"]) for row in case["history"]}
-        candidate_ids = sorted({int(movie["movie_id"]) for movie in case["candidates"]} - seen)
-        if len(candidate_ids) < 10:
-            raise ValueError("不足 10 部未看候选电影")
+        original_ids = sorted({int(movie["movie_id"]) for movie in case["candidates"]} - seen)
+        if len(original_ids) < self.coarse_k:
+            raise ValueError(f"不足 {self.coarse_k} 部未看候选电影")
         query = self._profile(case)
-        documents = [self._document(mid) for mid in candidate_ids]
+        documents = [self._document(mid) for mid in original_ids]
         vectors = self._vectors(documents, "document")
         query_vector = self._vectors([query], "query")[0]
         dense = vectors @ query_vector
-        collaborative, neighbors = self._neighbors(case, candidate_ids)
-        rerank_scores = None
-        if self.use_rerank:
-            response = self.client.rerank(query, documents, top_n=len(documents))
-            rerank_scores = {}
-            for result in response:
-                index = int(result["index"])
-                score = float(result["relevance_score"])
-                if index < 0 or index >= len(documents) or index in rerank_scores or not np.isfinite(score):
-                    raise ValueError("Rerank API 返回无效索引或分数")
-                rerank_scores[index] = score
-            if len(rerank_scores) != len(documents):
-                raise ValueError("Rerank API 未返回请求的全部候选结果")
+        collaborative, neighbors = self._neighbors(case, original_ids)
+        coarse_scores = {mid: 0.65 * (float(dense[i]) + 1) / 2
+                         + 0.35 * (collaborative[mid] + 1) / 2
+                         for i, mid in enumerate(original_ids)}
+        # 粗筛只使用向量与近邻支持，后续仅由重排模型决定精筛顺序。
+        selected = sorted(range(len(original_ids)),
+                          key=lambda i: (-coarse_scores[original_ids[i]], original_ids[i]))[:self.coarse_k]
+        candidate_ids = [original_ids[i] for i in selected]
+        selected_documents = [documents[i] for i in selected]
+        response = self.client.rerank(query, selected_documents, top_n=len(selected_documents))
+        rerank_scores = {}
+        for result in response:
+            index = int(result["index"])
+            score = float(result["relevance_score"])
+            if index < 0 or index >= len(selected) or index in rerank_scores or not np.isfinite(score):
+                raise ValueError("Rerank API 返回无效索引或分数")
+            rerank_scores[index] = score
+        if len(rerank_scores) != len(selected):
+            raise ValueError("Rerank API 未返回请求的全部候选结果")
         evidence = []
         for i, mid in enumerate(candidate_ids):
-            cf = (collaborative[mid] + 1) / 2
-            semantic = (float(dense[i]) + 1) / 2
-            score = (0.45 * rerank_scores[i] + 0.35 * cf + 0.20 * semantic
-                     if rerank_scores is not None else 0.65 * semantic + 0.35 * cf)
             movie = self.store.movies[mid]
             evidence.append({"evidence_id": f"movie_{mid}", "movie_id": mid,
                              "title": movie["title"], "genres": movie["genres"],
-                             "content": documents[i], "score": float(score),
-                             "dense_score": float(dense[i]), "collaborative_score": collaborative[mid],
-                             "rerank_score": rerank_scores[i] if rerank_scores is not None else None,
+                             "content": selected_documents[i], "score": rerank_scores[i],
+                             "dense_score": float(dense[selected[i]]),
+                             "collaborative_score": collaborative[mid],
+                             "coarse_score": coarse_scores[mid], "rerank_score": rerank_scores[i],
                              "neighbor_ratings": neighbors[mid],
                              "source": ["movies.csv", "train_ratings.csv"],
                              "positive_rating_count": self.store.positive_counts[mid]})
         evidence.sort(key=lambda row: (-row["score"], row["movie_id"]))
-        return {"query": query, "evidence": evidence[:self.top_k],
-                "meta": {"embedding_model": self.client.embedding_model,
-                         "use_rerank": self.use_rerank, "top_k": self.top_k,
-                         "candidate_count": len(candidate_ids), "neighbor_limit": 40,
-                         "score_formula": "0.45*rerank+0.35*(cf+1)/2+0.20*(cosine+1)/2"
-                         if self.use_rerank else "0.65*(cosine+1)/2+0.35*(cf+1)/2",
+        evidence = evidence[:self.top_k]
+        return {"query": query, "evidence": evidence,
+                "meta": {"pipeline": "cascade", "embedding_model": self.client.embedding_model,
+                         "top_k": self.top_k, "coarse_k": self.coarse_k,
+                         "candidate_count": len(original_ids), "rerank_candidate_count": len(selected),
+                         "neighbor_limit": 40,
+                         "stage_candidate_ids": {"coarse": candidate_ids,
+                                                 "rerank": [row["movie_id"] for row in evidence]},
+                         "coarse_score_formula": "0.65*(cosine+1)/2+0.35*(cf+1)/2",
+                         "score_formula": "rerank",
                          "profile_rule": "全部历史计算类型均分；最多8部高分和5部低分电影，评分优先、时间降序"}}

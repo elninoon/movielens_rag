@@ -1,4 +1,4 @@
-"""从完整的真实实验文件生成中文报告；不调用模型，不补造实验结果。"""
+"""重建旧版 outputs/formal 实验报告；不代表当前级联流程，当前对照用 analyze_cascade.py。"""
 
 from __future__ import annotations
 

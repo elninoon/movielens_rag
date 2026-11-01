@@ -4,9 +4,9 @@ from __future__ import annotations
 import json
 from .grounding import ground_recommendations
 
-PROMPT_VERSION = 'movielens-rag-1'
+PROMPT_VERSION = 'movielens-cascade-1'
 SYSTEM_PROMPT = '''你是电影推荐系统。仅依据输入数据推断偏好，评分>=4表示喜欢，<=2表示不喜欢。
-必须从给定100部候选中推荐10部不同电影，按适合用户的程度排序，不能推荐历史已看电影。
+必须从给定{candidate_count}部候选中推荐10部不同电影，按适合用户的程度排序，不能推荐历史已看电影。
 电影类型、上映信息、用户训练历史及检索证据是唯一事实来源。禁止使用记忆中的剧情、演员、影评或编造事实。
 优先考虑个性化匹配，同时参考证据中的训练评分统计及近邻支持，但不要把预测分数描述成真实评分。
 仅返回JSON对象 {"recommendations":[{"movie_id":整数,"rank":1,"reason":"简短中文理由","evidence_ids":["candidate_编号","history_编号","movie_编号"]}]}。
@@ -23,7 +23,9 @@ def build_messages(case: dict, retrieval: dict) -> tuple[list[dict], dict]:
     payload = {'user_id': case['user_id'], 'history': history, 'candidates': candidates,
                'retrieved_evidence': evidence}
     sources = {row['evidence_id']: row for row in history + candidates + evidence}
-    messages = [{'role': 'system', 'content': SYSTEM_PROMPT},
+    # 候选数与实际输入一致，在线推荐入口只接受精筛后的30部。
+    system_prompt = SYSTEM_PROMPT.replace('{candidate_count}', str(len(candidates)))
+    messages = [{'role': 'system', 'content': system_prompt},
                 {'role': 'user', 'content': json.dumps(payload, ensure_ascii=False)}]
     return messages, sources
 
@@ -58,7 +60,20 @@ def validate_response(payload: dict, case: dict, sources: dict) -> list[dict]:
     return output
 
 
+def select_generation_case(case: dict, retrieval: dict) -> dict:
+    """按精筛证据限制生成候选，完整保留历史与原始候选顺序。"""
+    ids = [row['movie_id'] for row in retrieval['evidence']]
+    allowed = set(ids)
+    candidates = [row for row in case['candidates'] if row['movie_id'] in allowed]
+    seen = {row['movie_id'] for row in case['history']}
+    if len(ids) != 30 or len(allowed) != 30 or len(candidates) != 30 or allowed & seen:
+        raise ValueError('精筛必须返回30部不同且未看的原始候选电影')
+    return {**case, 'candidates': candidates}
+
+
 def recommend(client, case: dict, retrieval: dict, method: str) -> dict:
+    if len(case["candidates"]) != 30:
+        raise ValueError("级联生成阶段必须恰好提供30部候选电影")
     messages, sources = build_messages(case, retrieval)
     attempts = []
     for attempt in range(2):
@@ -70,12 +85,14 @@ def recommend(client, case: dict, retrieval: dict, method: str) -> dict:
             return {'user_id': case['user_id'], 'method': method, 'status': 'ok',
                     'recommendations': ground_recommendations(case, rows),
                     'reason_policy': 'exact-rating-and-shared-genre-v1',
+                    'allowed_candidate_ids': [row['movie_id'] for row in case['candidates']],
                     'retrieval': retrieval, 'attempts': attempts}
         except (ValueError, TypeError, KeyError) as error:
             attempts[-1]['validation_error'] = str(error)
             if attempt == 1:
                 return {'user_id': case['user_id'], 'method': method, 'status': 'error',
                         'recommendations': [], 'error': str(error), 'retrieval': retrieval,
+                        'allowed_candidate_ids': [row['movie_id'] for row in case['candidates']],
                         'attempts': attempts}
             messages = messages + [{'role': 'assistant', 'content': content},
                 {'role': 'user', 'content': f'输出校验失败：{error}。请依据原始输入重新输出完整JSON。'}]

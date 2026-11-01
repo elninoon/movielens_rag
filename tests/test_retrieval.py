@@ -25,6 +25,7 @@ class FakeClient:
 
     def rerank(self, query, documents, top_n):
         self.rerank_calls += 1
+        self.last_rerank_documents = list(documents)
         return [{"index": i, "relevance_score": 1 / (i + 1)} for i in range(top_n)]
 
 
@@ -67,7 +68,7 @@ class RetrievalTests(unittest.TestCase):
         self.assertEqual(result["method"], "popular")
 
     def test_candidate_boundary_and_top_k(self):
-        retriever = Retriever(self.store, self.client, self.root / "cache", top_k=10)
+        retriever = Retriever(self.store, self.client, self.root / "cache", top_k=10, coarse_k=11)
         result = retriever.retrieve(self.case)
         self.assertEqual(len(result["evidence"]), 10)
         ids = [row["movie_id"] for row in result["evidence"]]
@@ -79,43 +80,62 @@ class RetrievalTests(unittest.TestCase):
         self.assertEqual(len(self.client.embedding_calls), 3)
 
     def test_persistent_cache_avoids_repeated_embedding(self):
-        retriever = Retriever(self.store, self.client, self.root / "cache", top_k=10)
+        retriever = Retriever(self.store, self.client, self.root / "cache", top_k=10, coarse_k=11)
         first = retriever.retrieve(self.case)
         calls = len(self.client.embedding_calls)
         second = retriever.retrieve(self.case)
         self.assertEqual(len(self.client.embedding_calls), calls)
         self.assertEqual(first, second)
-        restarted = Retriever(self.store, self.client, self.root / "cache", top_k=10)
+        restarted = Retriever(self.store, self.client, self.root / "cache", top_k=10, coarse_k=11)
         self.assertEqual(restarted.retrieve(self.case), first)
         self.assertEqual(len(self.client.embedding_calls), calls)
 
     def test_cache_identity_tracks_dimensions_and_service(self):
-        original = Retriever(self.store, self.client, self.root / "cache", top_k=10)
+        original = Retriever(self.store, self.client, self.root / "cache", top_k=10, coarse_k=11)
         self.client.dimensions = 1024
-        dimensional = Retriever(self.store, self.client, self.root / "cache", top_k=10)
+        dimensional = Retriever(self.store, self.client, self.root / "cache", top_k=10, coarse_k=11)
         self.client.base_url = "https://other-region.invalid/v1"
-        regional = Retriever(self.store, self.client, self.root / "cache", top_k=10)
+        regional = Retriever(self.store, self.client, self.root / "cache", top_k=10, coarse_k=11)
         self.assertEqual(len({original.cache_path, dimensional.cache_path, regional.cache_path}), 3)
 
     def test_no_validation_labels_required_or_read(self):
         # 不存在标签时可运行，存在无法解析的标签时结果也不变。
-        retriever = Retriever(self.store, self.client, self.root / "cache", top_k=10)
+        retriever = Retriever(self.store, self.client, self.root / "cache", top_k=10, coarse_k=11)
         first = retriever.retrieve(self.case)
         (self.root / "validation_labels.jsonl").write_text("THIS IS NOT JSON", encoding="utf-8")
         cases_path = self.root / "validation_cases.jsonl"
         cases_path.write_text(json.dumps(self.case) + "\n", encoding="utf-8")
         reloaded = DataStore(self.root)
         cases = load_cases(cases_path)
-        result = Retriever(reloaded, self.client, self.root / "cache", top_k=10).retrieve(cases[0])
+        result = Retriever(reloaded, self.client, self.root / "cache", top_k=10, coarse_k=11).retrieve(cases[0])
         self.assertEqual(result, first)
 
-    def test_no_rerank_and_minimum_top_k(self):
-        result = Retriever(self.store, self.client, self.root / "cache", top_k=30,
-                           use_rerank=False).retrieve(self.case)
-        self.assertEqual(len(result["evidence"]), 12)
-        self.assertEqual(self.client.rerank_calls, 0)
+    def test_stage_sizes_and_insufficient_candidates(self):
         with self.assertRaises(ValueError):
-            Retriever(self.store, self.client, self.root / "cache", top_k=9)
+            Retriever(self.store, self.client, self.root / 'cache', top_k=9)
+        with self.assertRaises(ValueError):
+            Retriever(self.store, self.client, self.root / 'cache', top_k=30, coarse_k=20)
+        with self.assertRaises(ValueError):
+            Retriever(self.store, self.client, self.root / 'cache').retrieve(self.case)
+
+    def test_cascade_filters_before_rerank_and_preserves_movie_mapping(self):
+        retriever = Retriever(self.store, self.client, self.root / 'cache', top_k=10, coarse_k=11)
+        # 重排分数按传入位置递减，便于检查粗筛后索引映射是否正确。
+        result = retriever.retrieve(self.case)
+        coarse = result['meta']['stage_candidate_ids']['coarse']
+        final = result['meta']['stage_candidate_ids']['rerank']
+        self.assertEqual(len(coarse), 11)
+        self.assertEqual(len(self.client.last_rerank_documents), 11)
+        self.assertEqual(result['meta']['candidate_count'], 12)
+        self.assertEqual(final, coarse[:10])
+        self.assertTrue(set(coarse) <= set(range(2, 14)))
+        self.assertEqual(self.client.last_rerank_documents,
+                         [retriever._document(mid) for mid in coarse])
+        self.assertEqual([row['score'] for row in result['evidence']],
+                         [1 / (i + 1) for i in range(10)])
+        self.assertEqual(result['meta']['score_formula'], 'rerank')
+        with self.assertRaises(ValueError):
+            Retriever(self.store, self.client, self.root / 'cache', top_k=10, coarse_k=9)
 
 
 if __name__ == "__main__":

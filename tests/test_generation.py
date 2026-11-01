@@ -117,6 +117,18 @@ class GenerationTests(unittest.TestCase):
             self.assertEqual(sources[sent_row["evidence_id"]], sent_row)
         self.assertEqual(self.case, original)
 
+    def test_cascade_prompt_and_validation_only_allow_retained_candidates(self):
+        case = {**self.case, 'candidates': self.case['candidates'][:30]}
+        messages, sources = build_messages(case, self.retrieval)
+        self.assertIn('给定30部候选', messages[0]['content'])
+        self.assertEqual(len(json.loads(messages[1]['content'])['history']), 200)
+        self.assertNotIn('candidate_31', sources)
+        payload = deepcopy(self.payload)
+        payload['recommendations'][0]['movie_id'] = 31
+        payload['recommendations'][0]['evidence_ids'] = ['candidate_31']
+        with self.assertRaises(ValueError):
+            validate_response(payload, case, sources)
+
     def test_ablation_only_changes_retrieved_evidence_in_messages(self):
         ablation = {**self.retrieval, "evidence": []}
         full_messages, full_sources = build_messages(self.case, self.retrieval)
